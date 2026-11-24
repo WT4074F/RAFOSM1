@@ -1,0 +1,205 @@
+# Builds the OS: pinned ReactOS source + our patches, overlay and branding -> bootable ISO.
+# The toolchain and source steps follow ReactOS's own CI (reactos/reactos .github/workflows/build.yml).
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: Build type
+        type: choice
+        options: [Release, Debug]
+        default: Release
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      ARCH: i386
+      CONFIG: ${{ inputs.config || 'Release' }}
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/ccache
+      CCACHE_MAXSIZE: 1G
+      CCACHE_SLOPPINESS: time_macros
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v6
+        with:
+          path: os
+
+      - name: Read upstream pin and brand
+        run: |
+          grep -E '^[A-Z_]+=' os/upstream.env >> "$GITHUB_ENV"
+          python3 - >> "$GITHUB_ENV" <<'EOF'
+          import configparser
+          cp = configparser.ConfigParser(interpolation=None)
+          cp.read("os/brand/brand.ini", encoding="utf-8")
+          b = cp["brand"]
+          print(f"OS_NAME={b['name']}")
+          print(f"OS_SLUG={b['slug']}")
+          print(f"OS_VERSION={b['version']}")
+          EOF
+
+      - name: Fetch ReactOS source
+        run: |
+          if ! git clone --depth 1 --branch "$REACTOS_REF" "$REACTOS_REPO" src; then
+            echo "::error::ReactOS ref '$REACTOS_REF' not found. Set REACTOS_REF in upstream.env to one of these:"
+            git ls-remote --tags --heads "$REACTOS_REPO" | awk '{print $2}' | grep -E '0\.4\.1[5-9]|releases/' | tail -n 30
+            exit 1
+          fi
+          echo "REACTOS_SHA=$(git -C src rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Building on ReactOS $REACTOS_REF ($(git -C src rev-parse --short HEAD))" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply patches
+        run: |
+          shopt -s nullglob
+          for p in os/patches/*.patch; do
+            echo "Applying $p"
+            git -C src apply --verbose "$GITHUB_WORKSPACE/$p"
+          done
+
+      - name: Copy overlay files
+        run: |
+          # Everything under overlay/ (except its README) is copied over the source tree as-is.
+          rsync -a --exclude README.md os/overlay/ src/
+
+      - name: Apply branding
+        run: |
+          pip install --quiet pillow
+          python3 os/brand/apply_branding.py src --report branding-report.txt --preview out/branding-preview
+          cat branding-report.txt >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- toolchain: same approach as ReactOS CI (RosBE built once, then cached) ----
+      - name: Get RosBE build specifics
+        id: rosbe
+        run: |
+          echo "march-sha=$(gcc -march=native -Q --help=target | sha1sum | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "git-sha=$(git ls-remote https://github.com/zefklop/RosBE.git | grep unix_amd64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          wget -q https://gist.githubusercontent.com/zefklop/b2d6a0b470c70183e93d5285a03f5899/raw/build_rosbe_ci.sh
+          sed -i 's|https\?://[^ "]*gcc-8\.4\.0\.tar\.xz|https://ftpmirror.gnu.org/gcc/gcc-8.4.0/gcc-8.4.0.tar.xz|' build_rosbe_ci.sh
+
+      - name: Get RosBE
+        id: rosbe-cache
+        uses: actions/cache@v5
+        with:
+          path: RosBE-CI
+          key: RosBE-CI-${{ runner.os }}-${{ steps.rosbe.outputs.march-sha }}-${{ steps.rosbe.outputs.git-sha }}-${{ hashfiles('build_rosbe_ci.sh') }}
+
+      - name: Compile RosBE
+        if: steps.rosbe-cache.outputs.cache-hit != 'true'
+        run: |
+          chmod +x build_rosbe_ci.sh
+          ./build_rosbe_ci.sh "$GITHUB_WORKSPACE/RosBE-CI"
+
+      - name: Install ccache
+        run: sudo apt-get update -q && sudo apt-get install -y -q ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v5
+        with:
+          path: ccache
+          key: ccache-gcc-${{ env.ARCH }}-${{ env.CONFIG }}-${{ github.sha }}
+          restore-keys: ccache-gcc-${{ env.ARCH }}-${{ env.CONFIG }}-
+
+      # ---- build ----
+      - name: Configure
+        env:
+          CCACHE_COMPILERCHECK: string:${{ steps.rosbe.outputs.git-sha }}-${{ hashfiles('build_rosbe_ci.sh') }}
+        run: |
+          echo "cmake -S $GITHUB_WORKSPACE/src -B $GITHUB_WORKSPACE/build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE:FILEPATH=toolchain-gcc.cmake -DARCH:STRING=$ARCH \
+            -DCMAKE_BUILD_TYPE=$CONFIG -DENABLE_CCACHE=1" \
+            | "$GITHUB_WORKSPACE/RosBE-CI/RosBE.sh" . 0 "$ARCH"
+
+      - name: Build
+        env:
+          CCACHE_COMPILERCHECK: string:${{ steps.rosbe.outputs.git-sha }}-${{ hashfiles('build_rosbe_ci.sh') }}
+        run: |
+          echo "set -o pipefail; cmake --build $GITHUB_WORKSPACE/build -- -k0 2>&1 | sed 's|^\.\./src/|$GITHUB_WORKSPACE/src/|'" \
+            | "$GITHUB_WORKSPACE/RosBE-CI/RosBE.sh" . 0 "$ARCH"
+
+      - name: Make ISO
+        env:
+          CCACHE_COMPILERCHECK: string:${{ steps.rosbe.outputs.git-sha }}-${{ hashfiles('build_rosbe_ci.sh') }}
+        run: |
+          echo "cmake --build $GITHUB_WORKSPACE/build --target bootcd" | "$GITHUB_WORKSPACE/RosBE-CI/RosBE.sh" . 0 "$ARCH"
+          ISO="$OS_SLUG-$OS_VERSION-$ARCH-$CONFIG-${GITHUB_SHA::7}.iso"
+          mkdir -p out
+          cp build/bootcd.iso "out/$ISO"
+          echo "ISO=out/$ISO" >> "$GITHUB_ENV"
+          ccache -s
+
+      # ---- check it actually boots ----
+      - name: Boot test in QEMU
+        run: |
+          sudo apt-get install -y -q qemu-system-x86 qemu-utils
+          # Let the runner user use KVM if the runner offers it; the test still works (slower) without.
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+            sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          fi
+          bash os/tools/smoke_boot.sh "$ISO" out/boot-test
+
+      - name: Write credits into the build
+        run: |
+          cat > out/CREDITS.txt <<EOF
+          $OS_NAME $OS_VERSION is based on ReactOS (https://reactos.org),
+          built from $REACTOS_REPO at $REACTOS_REF ($REACTOS_SHA).
+          ReactOS is free software by the ReactOS Team and contributors, licensed mainly
+          under the GNU GPL version 2 or later; see the COPYING files in the ReactOS source.
+          $OS_NAME is not affiliated with or endorsed by the ReactOS project or Microsoft.
+          EOF
+          cp src/COPYING* out/ 2>/dev/null || true
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.OS_SLUG }}-${{ env.ARCH }}-${{ env.CONFIG }}-${{ github.sha }}
+          path: |
+            out/*.iso
+            out/CREDITS.txt
+            out/COPYING*
+          compression-level: 0
+
+      - name: Upload boot test and branding report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: boot-test-${{ env.CONFIG }}-${{ github.sha }}
+          path: |
+            out/boot-test/
+            out/branding-preview/
+            branding-report.txt
+          if-no-files-found: ignore
+
+  release:
+    # Push a tag like v0.1 to publish the ISO as a GitHub release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes "Based on ReactOS. See CREDITS.txt. As stable as the ReactOS release it's built on." \
+            dist/*.iso dist/CREDITS.txt dist/COPYING*
